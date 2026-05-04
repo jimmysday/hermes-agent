@@ -25,6 +25,7 @@ import struct
 import tempfile
 import time
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -1123,8 +1124,22 @@ async def qr_login(
         return None
 
 
+@dataclass
+class _AccountInfo:
+    """Per-account data for multi-account WeChat support."""
+    account_id: str = ""
+    token: str = ""
+    base_url: str = ""
+    cdn_base_url: str = ""
+    user_id: str = ""
+    poll_session: Optional[Any] = None
+    send_session: Optional[Any] = None
+    poll_task: Optional[Any] = None
+    sync_buf: str = ""
+
+
 class WeixinAdapter(BasePlatformAdapter):
-    """Native Hermes adapter for Weixin personal accounts."""
+    """Native Hermes adapter for Weixin personal accounts (multi-account)."""
 
     MAX_MESSAGE_LENGTH = 2000
 
@@ -1139,17 +1154,9 @@ class WeixinAdapter(BasePlatformAdapter):
         self._hermes_home = hermes_home
         self._token_store = ContextTokenStore(hermes_home)
         self._typing_cache = TypingTicketCache()
-        self._poll_session: Optional[aiohttp.ClientSession] = None
-        self._send_session: Optional[aiohttp.ClientSession] = None
-        self._poll_task: Optional[asyncio.Task] = None
         self._dedup = MessageDeduplicator(ttl_seconds=MESSAGE_DEDUP_TTL_SECONDS)
 
-        self._account_id = str(extra.get("account_id") or os.getenv("WEIXIN_ACCOUNT_ID", "")).strip()
-        self._token = str(config.token or extra.get("token") or os.getenv("WEIXIN_TOKEN", "")).strip()
-        self._base_url = str(extra.get("base_url") or os.getenv("WEIXIN_BASE_URL", ILINK_BASE_URL)).strip().rstrip("/")
-        self._cdn_base_url = str(
-            extra.get("cdn_base_url") or os.getenv("WEIXIN_CDN_BASE_URL", WEIXIN_CDN_BASE_URL)
-        ).strip().rstrip("/")
+        # Shared send config
         self._send_chunk_delay_seconds = float(
             extra.get("send_chunk_delay_seconds") or os.getenv("WEIXIN_SEND_CHUNK_DELAY_SECONDS", "1.5")
         )
@@ -1176,11 +1183,108 @@ class WeixinAdapter(BasePlatformAdapter):
             default=False,
         )
 
-        if self._account_id and not self._token:
-            persisted = load_weixin_account(hermes_home, self._account_id)
-            if persisted:
-                self._token = str(persisted.get("token") or "").strip()
-                self._base_url = str(persisted.get("base_url") or self._base_url).strip().rstrip("/")
+        # Multi-account state
+        self._accounts: Dict[str, _AccountInfo] = {}
+        self._user_to_account: Dict[str, str] = {}  # user_id -> account_id
+        self._primary_account_id: str = ""
+        self._load_all_accounts(extra)
+
+    def _load_all_accounts(self, extra: Dict[str, Any]) -> None:
+        """Load all WeChat accounts from env var (primary) + weixin/accounts/ directory."""
+        env_account_id = str(extra.get("account_id") or os.getenv("WEIXIN_ACCOUNT_ID", "")).strip()
+
+        # Try config object first, then extras, then env for token
+        env_token = ""
+        try:
+            cfg = self.config
+            if cfg and cfg.token:
+                env_token = str(cfg.token).strip()
+        except Exception:
+            pass
+        if not env_token:
+            env_token = str(extra.get("token") or os.getenv("WEIXIN_TOKEN", "")).strip()
+
+        env_base_url = str(extra.get("base_url") or os.getenv("WEIXIN_BASE_URL", ILINK_BASE_URL)).strip().rstrip("/")
+        env_cdn_base_url = str(
+            extra.get("cdn_base_url") or os.getenv("WEIXIN_CDN_BASE_URL", WEIXIN_CDN_BASE_URL)
+        ).strip().rstrip("/")
+
+        # Try to get account_id from config extra as fallback
+        try:
+            cfg = self.config
+            if cfg and cfg.extra and cfg.extra.get("account_id") and not env_account_id:
+                env_account_id = str(cfg.extra["account_id"]).strip()
+        except Exception:
+            pass
+
+        # 1. Load primary account from env / config
+        if env_account_id and env_token:
+            persisted = load_weixin_account(self._hermes_home, env_account_id)
+            user_id = str(persisted.get("user_id", "")) if persisted else ""
+            acct = _AccountInfo(
+                account_id=env_account_id,
+                token=env_token,
+                base_url=env_base_url,
+                cdn_base_url=env_cdn_base_url,
+                user_id=user_id,
+            )
+            self._accounts[env_account_id] = acct
+            if user_id:
+                self._user_to_account[user_id] = env_account_id
+            self._primary_account_id = env_account_id
+
+        # 2. Scan accounts/ directory for additional accounts
+        acct_dir = _account_dir(self._hermes_home)
+        if acct_dir.exists():
+            for fpath in sorted(acct_dir.iterdir()):
+                if not fpath.name.endswith(".json"):
+                    continue
+                if fpath.name.endswith(".sync.json") or fpath.name.endswith(".context-tokens.json"):
+                    continue
+                account_id = fpath.stem
+                if account_id in self._accounts:
+                    continue  # Already loaded from env
+                try:
+                    data = json.loads(fpath.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                token = str(data.get("token", "")).strip()
+                user_id = str(data.get("user_id", "")).strip()
+                base_url = str(data.get("base_url", env_base_url)).strip().rstrip("/")
+                if not token or not user_id:
+                    continue
+                acct = _AccountInfo(
+                    account_id=account_id,
+                    token=token,
+                    base_url=base_url,
+                    cdn_base_url=env_cdn_base_url,
+                    user_id=user_id,
+                )
+                self._accounts[account_id] = acct
+                self._user_to_account[user_id] = account_id
+
+        if not self._accounts:
+            logger.warning("[%s] No WeChat accounts found", self.name)
+        else:
+            logger.info(
+                "[%s] Loaded %d WeChat account(s): %s",
+                self.name,
+                len(self._accounts),
+                ", ".join(_safe_id(a) for a in self._accounts),
+            )
+
+    def _get_account_for_user(self, user_id: str) -> Optional[_AccountInfo]:
+        """Find the account whose bot token can reach this WeChat user."""
+        account_id = self._user_to_account.get(user_id)
+        if account_id and account_id in self._accounts:
+            return self._accounts[account_id]
+        # Fallback: primary account
+        if self._primary_account_id and self._primary_account_id in self._accounts:
+            return self._accounts[self._primary_account_id]
+        # Fallback: any account
+        for acct in self._accounts.values():
+            return acct
+        return None
 
     @staticmethod
     def _coerce_list(value: Any) -> List[str]:
@@ -1198,30 +1302,47 @@ class WeixinAdapter(BasePlatformAdapter):
             self._set_fatal_error("weixin_missing_dependency", message, retryable=False)
             logger.warning("[%s] %s", self.name, message)
             return False
-        if not self._token:
-            message = "Weixin startup failed: WEIXIN_TOKEN is required"
-            self._set_fatal_error("weixin_missing_token", message, retryable=False)
-            logger.warning("[%s] %s", self.name, message)
-            return False
-        if not self._account_id:
-            message = "Weixin startup failed: WEIXIN_ACCOUNT_ID is required"
-            self._set_fatal_error("weixin_missing_account", message, retryable=False)
+        if not self._accounts:
+            message = "Weixin startup failed: no accounts found"
+            self._set_fatal_error("weixin_no_accounts", message, retryable=False)
             logger.warning("[%s] %s", self.name, message)
             return False
 
-        try:
-            if not self._acquire_platform_lock('weixin-bot-token', self._token, 'Weixin bot token'):
-                return False
-        except Exception as exc:
-            logger.debug("[%s] Token lock unavailable (non-fatal): %s", self.name, exc)
+        connected_count = 0
+        for account_id, account in list(self._accounts.items()):
+            try:
+                if not self._acquire_platform_lock(
+                    f'weixin-bot-token-{account_id}', account.token,
+                    f'Weixin bot token ({_safe_id(account_id)})'
+                ):
+                    logger.warning("[%s] Could not acquire lock for account %s, skipping",
+                                   self.name, _safe_id(account_id))
+                    continue
+            except Exception as exc:
+                logger.debug("[%s] Token lock unavailable for %s (non-fatal): %s",
+                             self.name, _safe_id(account_id), exc)
 
-        self._poll_session = aiohttp.ClientSession(trust_env=True, connector=_make_ssl_connector())
-        self._send_session = aiohttp.ClientSession(trust_env=True, connector=_make_ssl_connector())
-        self._token_store.restore(self._account_id)
-        self._poll_task = asyncio.create_task(self._poll_loop(), name="weixin-poll")
+            account.poll_session = aiohttp.ClientSession(trust_env=True, connector=_make_ssl_connector())
+            account.send_session = aiohttp.ClientSession(trust_env=True, connector=_make_ssl_connector())
+            account.sync_buf = _load_sync_buf(self._hermes_home, account_id)
+            self._token_store.restore(account_id)
+            account.poll_task = asyncio.create_task(
+                self._poll_account_loop(account_id),
+                name=f"weixin-poll-{_safe_id(account_id)}",
+            )
+            connected_count += 1
+            logger.info("[%s] Connected account=%s base=%s user=%s",
+                         self.name, _safe_id(account_id), account.base_url, _safe_id(account.user_id))
+
+        if connected_count == 0:
+            message = "Weixin startup failed: could not connect any account"
+            self._set_fatal_error("weixin_connect_failed", message, retryable=False)
+            return False
+
         self._mark_connected()
-        _LIVE_ADAPTERS[self._token] = self
-        logger.info("[%s] Connected account=%s base=%s", self.name, _safe_id(self._account_id), self._base_url)
+        for account in self._accounts.values():
+            _LIVE_ADAPTERS[account.token] = self
+
         if self._group_policy != "disabled":
             logger.warning(
                 "[%s] WEIXIN_GROUP_POLICY=%s is set, but QR-login connects an iLink bot "
@@ -1236,37 +1357,44 @@ class WeixinAdapter(BasePlatformAdapter):
         return True
 
     async def disconnect(self) -> None:
-        _LIVE_ADAPTERS.pop(self._token, None)
+        for account in self._accounts.values():
+            _LIVE_ADAPTERS.pop(account.token, None)
         self._running = False
-        if self._poll_task and not self._poll_task.done():
-            self._poll_task.cancel()
-            try:
-                await self._poll_task
-            except asyncio.CancelledError:
-                pass
-        self._poll_task = None
-        if self._poll_session and not self._poll_session.closed:
-            await self._poll_session.close()
-        self._poll_session = None
-        if self._send_session and not self._send_session.closed:
-            await self._send_session.close()
-        self._send_session = None
+        for account in self._accounts.values():
+            if account.poll_task and not account.poll_task.done():
+                account.poll_task.cancel()
+        for account in self._accounts.values():
+            if account.poll_task:
+                try:
+                    await account.poll_task
+                except asyncio.CancelledError:
+                    pass
+                account.poll_task = None
+        for account in self._accounts.values():
+            if account.poll_session and not account.poll_session.closed:
+                await account.poll_session.close()
+            account.poll_session = None
+            if account.send_session and not account.send_session.closed:
+                await account.send_session.close()
+            account.send_session = None
         self._release_platform_lock()
         self._mark_disconnected()
-        logger.info("[%s] Disconnected", self.name)
+        logger.info("[%s] Disconnected (%d accounts)", self.name, len(self._accounts))
 
-    async def _poll_loop(self) -> None:
-        assert self._poll_session is not None
-        sync_buf = _load_sync_buf(self._hermes_home, self._account_id)
+    async def _poll_account_loop(self, account_id: str) -> None:
+        account = self._accounts.get(account_id)
+        if not account or not account.poll_session:
+            return
+        sync_buf = account.sync_buf or ""
         timeout_ms = LONG_POLL_TIMEOUT_MS
         consecutive_failures = 0
 
         while self._running:
             try:
                 response = await _get_updates(
-                    self._poll_session,
-                    base_url=self._base_url,
-                    token=self._token,
+                    account.poll_session,
+                    base_url=account.base_url,
+                    token=account.token,
                     sync_buf=sync_buf,
                     timeout_ms=timeout_ms,
                 )
@@ -1279,16 +1407,16 @@ class WeixinAdapter(BasePlatformAdapter):
                 if ret not in (0, None) or errcode not in (0, None):
                     if (ret == SESSION_EXPIRED_ERRCODE or errcode == SESSION_EXPIRED_ERRCODE
                             or _is_stale_session_ret(ret, errcode, response.get("errmsg"))):
-                        logger.error("[%s] Session expired; pausing for 10 minutes", self.name)
+                        logger.error("[%s] Session expired for account %s; pausing for 10 minutes",
+                                     self.name, _safe_id(account_id))
                         await asyncio.sleep(600)
                         consecutive_failures = 0
                         continue
                     consecutive_failures += 1
                     logger.warning(
-                        "[%s] getUpdates failed ret=%s errcode=%s errmsg=%s (%d/%d)",
-                        self.name,
-                        ret,
-                        errcode,
+                        "[%s] getUpdates failed for account %s ret=%s errcode=%s errmsg=%s (%d/%d)",
+                        self.name, _safe_id(account_id),
+                        ret, errcode,
                         response.get("errmsg", ""),
                         consecutive_failures,
                         MAX_CONSECUTIVE_FAILURES,
@@ -1302,38 +1430,44 @@ class WeixinAdapter(BasePlatformAdapter):
                 new_sync_buf = str(response.get("get_updates_buf") or "")
                 if new_sync_buf:
                     sync_buf = new_sync_buf
-                    _save_sync_buf(self._hermes_home, self._account_id, sync_buf)
+                    _save_sync_buf(self._hermes_home, account_id, sync_buf)
 
                 for message in response.get("msgs") or []:
-                    asyncio.create_task(self._process_message_safe(message))
+                    asyncio.create_task(self._process_message_safe(message, account_id))
             except asyncio.CancelledError:
                 break
             except Exception as exc:
                 consecutive_failures += 1
-                logger.error("[%s] poll error (%d/%d): %s", self.name, consecutive_failures, MAX_CONSECUTIVE_FAILURES, exc)
+                logger.error("[%s] poll error for account %s (%d/%d): %s",
+                             self.name, _safe_id(account_id),
+                             consecutive_failures, MAX_CONSECUTIVE_FAILURES, exc)
                 await asyncio.sleep(BACKOFF_DELAY_SECONDS if consecutive_failures >= MAX_CONSECUTIVE_FAILURES else RETRY_DELAY_SECONDS)
                 if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
                     consecutive_failures = 0
 
-    async def _process_message_safe(self, message: Dict[str, Any]) -> None:
+    async def _process_message_safe(self, message: Dict[str, Any], account_id: str) -> None:
         try:
-            await self._process_message(message)
+            await self._process_message(message, account_id)
         except Exception as exc:
-            logger.error("[%s] unhandled inbound error from=%s: %s", self.name, _safe_id(message.get("from_user_id")), exc, exc_info=True)
+            logger.error("[%s] unhandled inbound error from=%s account=%s: %s",
+                         self.name, _safe_id(message.get("from_user_id")),
+                         _safe_id(account_id), exc, exc_info=True)
 
-    async def _process_message(self, message: Dict[str, Any]) -> None:
-        assert self._poll_session is not None
+    async def _process_message(self, message: Dict[str, Any], account_id: str) -> None:
+        account = self._accounts.get(account_id)
+        if not account or not account.poll_session:
+            return
         sender_id = str(message.get("from_user_id") or "").strip()
         if not sender_id:
             return
-        if sender_id == self._account_id:
+        if sender_id == account_id:
             return
 
         message_id = str(message.get("message_id") or "").strip()
         if message_id and self._dedup.is_duplicate(message_id):
             return
 
-        chat_type, effective_chat_id = _guess_chat_type(message, self._account_id)
+        chat_type, effective_chat_id = _guess_chat_type(message, account_id)
         if chat_type == "group":
             if self._group_policy == "disabled":
                 return
@@ -1344,8 +1478,8 @@ class WeixinAdapter(BasePlatformAdapter):
 
         context_token = str(message.get("context_token") or "").strip()
         if context_token:
-            self._token_store.set(self._account_id, sender_id, context_token)
-        asyncio.create_task(self._maybe_fetch_typing_ticket(sender_id, context_token or None))
+            self._token_store.set(account_id, sender_id, context_token)
+        asyncio.create_task(self._maybe_fetch_typing_ticket(account_id, sender_id, context_token or None))
 
         item_list = message.get("item_list") or []
         text = _extract_text(item_list)

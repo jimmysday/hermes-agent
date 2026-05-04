@@ -119,6 +119,20 @@ const MAX_RECENT_IDS = 50;
 
 let sock = null;
 let connectionState = 'disconnected';
+let lastMessageTimestamp = Date.now();
+
+// Watchdog: if no messages received for 120s, force reconnect
+const MESSAGE_WATCHDOG_INTERVAL = 30_000; // check every 30s
+const MESSAGE_WATCHDOG_TIMEOUT = 120_000; // 120s without messages = reconnection needed
+
+setInterval(() => {
+  if (connectionState !== 'connected') return;
+  const idle = Date.now() - lastMessageTimestamp;
+  if (idle > MESSAGE_WATCHDOG_TIMEOUT) {
+    console.log(`⚠️  No messages for ${(idle/1000).toFixed(0)}s. Recycling connection...`);
+    try { sock?.ws?.close(); } catch {}
+  }
+}, MESSAGE_WATCHDOG_INTERVAL);
 
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
@@ -130,8 +144,10 @@ async function startSocket() {
     logger,
     printQRInTerminal: false,
     browser: ['Hermes Agent', 'Chrome', '120.0'],
-    syncFullHistory: false,
-    markOnlineOnConnect: false,
+    syncFullHistory: true,
+    markOnlineOnConnect: true,
+    fireInitQueries: true,
+    shouldSyncFullHistory: () => false,
     // Required for Baileys 7.x: without this, incoming messages that need
     // E2EE session re-establishment are silently dropped (msg.message === null)
     getMessage: async (key) => {
@@ -360,6 +376,7 @@ async function startSocket() {
         timestamp: msg.messageTimestamp,
       };
 
+      lastMessageTimestamp = Date.now();
       messageQueue.push(event);
       if (messageQueue.length > MAX_QUEUE_SIZE) {
         messageQueue.shift();
